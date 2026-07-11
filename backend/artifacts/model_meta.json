@@ -1,7 +1,7 @@
 {
   "model_type": "RandomForestRegressor",
-  "n_estimators": 200,
-  "max_depth": 20,
+  "n_estimators": 40,
+  "max_depth": 8,
   "features": [
     "MedInc",
     "HouseAge",
@@ -13,18 +13,18 @@
     "Longitude"
   ],
   "feature_importance": {
-    "MedInc": 0.24477529846763715,
-    "AveOccup": 0.07365807878714245,
-    "Latitude": 0.04463720747601408,
-    "Longitude": 0.04448045162009942,
-    "HouseAge": 0.027281841204703925,
-    "AveRooms": 0.02209122061598836,
-    "Population": 0.015051815630762855,
-    "AveBedrms": 0.014627087388273716
+    "MedInc": 0.29729901440087503,
+    "AveOccup": 0.07334744048526844,
+    "Latitude": 0.03305624439338452,
+    "Longitude": 0.03202408085535026,
+    "HouseAge": 0.025583920987450194,
+    "AveRooms": 0.012048730513039486,
+    "Population": 0.005117315437575785,
+    "AveBedrms": 0.004384545446693004
   },
   "metrics": {
-    "mse": 0.25472679029150364,
-    "r2": 0.8056127556196613
+    "mse": 0.34170651930083557,
+    "r2": 0.7392367383200134
   },
   "target_description": "Median house value in units of $100,000 (California districts)",
   "dataset_summary": {

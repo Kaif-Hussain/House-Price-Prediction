@@ -4,22 +4,22 @@ import pandas as pd
 import numpy as np
 import io
 import contextlib
+import json
 import os
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Any
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
-from langchain_core.messages import AnyMessage, SystemMessage
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import SystemMessage, ToolMessage
 from dotenv import load_dotenv
 from backend.model_utils import meta
-load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
+ROOT_DIR = BASE_DIR.parent
+
+load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
 with open(ARTIFACTS_DIR / "model.pkl", "rb") as f:
     model = pickle.load(f)
@@ -36,7 +36,18 @@ def _top_feature_importances(limit: int = 3) -> str:
     return ", ".join(f"{name} ({value:.3f})" for name, value in items)
 
 
-def _local_fallback_response(message: str) -> str:
+def _run_python_code(code: str) -> str:
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            exec(code, {"__builtins__": {}}, dict(SAFE_GLOBALS))
+    except Exception as e:
+        return f"Error running code: {e}"
+    result = output.getvalue().strip()
+    return result if result else "Code ran but produced no printed output."
+
+
+def _quota_fallback_response(message: str) -> str:
     text = message.lower()
 
     if any(keyword in text for keyword in ["who develops", "who developed", "who made", "who created", "who built", "your creator", "your developer", "your author", "made you", "built you", "created you"]):
@@ -49,23 +60,21 @@ def _local_fallback_response(message: str) -> str:
     if any(keyword in text for keyword in ["who are you", "what are you", "your name"]):
         return (
             f"I'm an assistant for exploring a {meta['model_type']} trained to predict "
-            f"{meta['target_description']}. Right now I'm running in a limited local fallback mode "
-            f"because the hosted chatbot is rate-limited, so I can only answer questions about the "
-            f"model and dataset."
+            f"{meta['target_description']}. Gemini is temporarily unavailable, so I'm giving you the "
+            f"best local answer I can from the model metadata."
         )
 
     if any(keyword in text for keyword in ["hi", "hello", "hey", "greetings"]) and len(text.split()) <= 4:
         return (
-            "Hi! I'm currently running in a limited local fallback mode (the hosted chatbot is "
-            "rate-limited), but I can still answer questions about the housing price model, its "
-            "features, metrics, or the dataset."
+            "Hi! Gemini is temporarily unavailable right now, but I can still answer questions about "
+            "the housing price model, its features, metrics, or the dataset."
         )
 
     if any(keyword in text for keyword in ["what can you do", "help", "capabilities", "what do you do"]):
         return (
-            "In this fallback mode I can answer questions about the trained model (type, metrics, "
-            "feature importances) and the dataset it was trained on. For anything else, please try "
-            "again once the hosted chatbot is available."
+            "I can answer questions about the trained model (type, metrics, feature importances) and "
+            "the dataset it was trained on. If you ask something general, Gemini will answer it when "
+            "the hosted chatbot is available."
         )
 
     if any(keyword in text for keyword in ["which model", "what model", "machine learning model", "ml model", "trained model"]):
@@ -99,9 +108,8 @@ def _local_fallback_response(message: str) -> str:
         )
 
     return (
-        f"I'm temporarily using local model metadata because the hosted chatbot is rate-limited, "
-        f"so I can't answer general questions right now — only questions about this housing price "
-        f"model. The model is a {meta['model_type']} predicting {meta['target_description']}. "
+        f"Gemini is temporarily unavailable, so I'm falling back to local model metadata. "
+        f"The model is a {meta['model_type']} predicting {meta['target_description']}. "
         f"Top features: { _top_feature_importances() }."
     )
 
@@ -120,51 +128,80 @@ def run_python(code: str) -> str:
     access via model.named_steps['model']), `pd`, `np`.
     Always end with a print(...) statement — only printed output is returned.
     """
-    output = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(output):
-            exec(code, {"__builtins__": {}}, dict(SAFE_GLOBALS))
-    except Exception as e:
-        return f"Error running code: {e}"
-    result = output.getvalue().strip()
-    return result if result else "Code ran but produced no printed output."
+    return _run_python_code(code)
 
 tools = [run_python]
 llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
     temperature=0,
-).bind_tools(tools, tool_choice="any")
+    max_retries=0,
+).bind_tools(tools, tool_choice="auto")
 
 SYSTEM_PROMPT = (
-    f"You are an assistant explaining a California housing price prediction model. "
+    f"You are a helpful assistant for a California housing price prediction app. "
+    f"Answer general questions directly. Only use tools when the user asks for data, calculations, or model-specific analysis. "
     f"The trained model is a {meta['model_type']} that predicts {meta['target_description']}. "
-    "You can answer ANY question about the dataset or the trained model by writing "
-    "Python/pandas code and running it with the run_python tool. Always compute real "
-    "answers rather than guessing. Keep answers concise and non-technical unless asked."
+    "Use the run_python tool only when the answer depends on the dataset or the trained model. "
+    "Always compute real answers rather than guessing when the question depends on the data. "
+    "Keep answers concise and non-technical unless asked."
 )
 
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+def _message_value(message: Any, key: str, default: Any = None) -> Any:
+    if isinstance(message, dict):
+        return message.get(key, default)
+    return getattr(message, key, default)
 
-def call_model(state: AgentState):
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    response = llm.invoke(messages)
-    return {"messages": [response]}
 
-graph = StateGraph(AgentState)
-graph.add_node("agent", call_model)
-graph.add_node("tools", ToolNode(tools))
-graph.set_entry_point("agent")
-graph.add_conditional_edges("agent", tools_condition)
-graph.add_edge("tools", "agent")
+def _extract_code_from_tool_call(tool_call: Any) -> str:
+    args = _message_value(tool_call, "args", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return ""
+    if isinstance(args, dict):
+        return str(args.get("code", ""))
+    return ""
 
-agent = graph.compile()
+
+def _invoke_llm(messages: list[Any]):
+    return llm.invoke([SystemMessage(content=SYSTEM_PROMPT)] + messages)
+
+
+def _answer_with_one_tool_round(message: str) -> str:
+    user_messages: list[Any] = [("user", message)]
+    first_response = _invoke_llm(user_messages)
+
+    tool_calls = _message_value(first_response, "tool_calls", []) or []
+    if not tool_calls:
+        return _message_value(first_response, "content", "") or ""
+
+    tool_messages: list[ToolMessage] = []
+    for tool_call in tool_calls:
+        tool_name = _message_value(tool_call, "name", "")
+        if tool_name != "run_python":
+            continue
+        code = _extract_code_from_tool_call(tool_call)
+        tool_call_id = _message_value(tool_call, "id", "")
+        if not tool_call_id:
+            continue
+        tool_messages.append(ToolMessage(content=_run_python_code(code), tool_call_id=tool_call_id))
+
+    if not tool_messages:
+        return _message_value(first_response, "content", "") or ""
+
+    follow_up_messages: list[Any] = user_messages + [first_response] + tool_messages
+    final_response = _invoke_llm(follow_up_messages)
+    final_content = _message_value(final_response, "content", "") or ""
+    if final_content:
+        return final_content
+    return _message_value(first_response, "content", "") or ""
 
 def ask_chatbot(message: str) -> str:
     try:
-        result = agent.invoke({"messages": [("user", message)]})
-        return result["messages"][-1].content
+        return _answer_with_one_tool_round(message)
     except Exception as exc:
         if _is_quota_error(exc):
-            return _local_fallback_response(message)
+            return _quota_fallback_response(message)
         return "Sorry, the chatbot is temporarily unavailable right now. Please try again later."

@@ -39,6 +39,35 @@ def _top_feature_importances(limit: int = 3) -> str:
 def _local_fallback_response(message: str) -> str:
     text = message.lower()
 
+    if any(keyword in text for keyword in ["who develops", "who developed", "who made", "who created", "who built", "your creator", "your developer", "your author", "made you", "built you", "created you"]):
+        return (
+            "I'm the assistant for this California housing price prediction app, currently answering "
+            "from local model metadata because the hosted chatbot is rate-limited. I don't have information "
+            "about the individual developer of this app — that's not something stored in the model or dataset."
+        )
+
+    if any(keyword in text for keyword in ["who are you", "what are you", "your name"]):
+        return (
+            f"I'm an assistant for exploring a {meta['model_type']} trained to predict "
+            f"{meta['target_description']}. Right now I'm running in a limited local fallback mode "
+            f"because the hosted chatbot is rate-limited, so I can only answer questions about the "
+            f"model and dataset."
+        )
+
+    if any(keyword in text for keyword in ["hi", "hello", "hey", "greetings"]) and len(text.split()) <= 4:
+        return (
+            "Hi! I'm currently running in a limited local fallback mode (the hosted chatbot is "
+            "rate-limited), but I can still answer questions about the housing price model, its "
+            "features, metrics, or the dataset."
+        )
+
+    if any(keyword in text for keyword in ["what can you do", "help", "capabilities", "what do you do"]):
+        return (
+            "In this fallback mode I can answer questions about the trained model (type, metrics, "
+            "feature importances) and the dataset it was trained on. For anything else, please try "
+            "again once the hosted chatbot is available."
+        )
+
     if any(keyword in text for keyword in ["which model", "what model", "machine learning model", "ml model", "trained model"]):
         return (
             f"The prediction model is a {meta['model_type']} with {meta['n_estimators']} trees and max_depth={meta['max_depth']}. "
@@ -70,8 +99,9 @@ def _local_fallback_response(message: str) -> str:
         )
 
     return (
-        f"I’m temporarily using local model metadata because the hosted chatbot is rate-limited. "
-        f"The model is a {meta['model_type']} predicting {meta['target_description']}. "
+        f"I'm temporarily using local model metadata because the hosted chatbot is rate-limited, "
+        f"so I can't answer general questions right now — only questions about this housing price "
+        f"model. The model is a {meta['model_type']} predicting {meta['target_description']}. "
         f"Top features: { _top_feature_importances() }."
     )
 

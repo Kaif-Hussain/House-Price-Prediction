@@ -1,4 +1,5 @@
 # frontend/app.py
+import html
 import os
 import requests
 import streamlit as st
@@ -142,11 +143,16 @@ with tab2:
             {"role": "assistant", "content": "Hi! Ask me anything about the model or the dataset it was trained on 🏡"}
         ]
 
+    def _safe_chat_content(value):
+        if value is None:
+            return ""
+        return html.escape(str(value))
+
     # Build HTML with NO leading whitespace per line (avoids markdown code-block bug)
     parts = ['<div class="chat-container">']
     for msg in st.session_state.chat_history:
         role_class = "user" if msg["role"] == "user" else "assistant"
-        content = msg["content"].replace("<", "&lt;").replace(">", "&gt;")
+        content = _safe_chat_content(msg.get("content"))
         parts.append(f'<div class="bubble-row {role_class}"><div class="bubble {role_class}">{content}</div></div>')
     parts.append('</div>')
     st.markdown("".join(parts), unsafe_allow_html=True)
@@ -158,7 +164,7 @@ with tab2:
             try:
                 res = requests.post(f"{API_URL}/chat", json={"message": user_msg}, timeout=60)
                 res.raise_for_status()
-                reply = res.json()["response"]
+                reply = str(res.json().get("response", ""))
             except requests.exceptions.RequestException as e:
                 reply = f"⚠️ Error contacting backend: {e}"
         st.session_state.chat_history.append({"role": "assistant", "content": reply})

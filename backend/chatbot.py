@@ -6,10 +6,15 @@ import io
 import contextlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, ToolMessage
 from dotenv import load_dotenv
@@ -25,6 +30,89 @@ with open(ARTIFACTS_DIR / "model.pkl", "rb") as f:
     model = pickle.load(f)
 
 df = pd.read_csv(ARTIFACTS_DIR / "california_housing.csv")
+
+
+# ----------------------------------------------------------------------
+# RAG knowledge base
+# ----------------------------------------------------------------------
+# Instead of leaning on the LLM to call the run_python tool for every
+# question (each tool call costs a *second* Gemini call and burns through
+# free-tier quota twice as fast), we pre-compute a small set of text
+# "documents" describing the model, dataset and features. At request time
+# we retrieve the most relevant snippets locally (TF-IDF, no API call) and
+# inject them into the prompt. Most questions can then be answered in a
+# single Gemini call. run_python remains available as a tool for anything
+# that genuinely needs live computation the knowledge base doesn't cover.
+
+FEATURE_GLOSSARY = {
+    "MedInc": "Median income of households in the block group (tens of thousands of USD).",
+    "HouseAge": "Median age of houses in the block group (years).",
+    "AveRooms": "Average number of rooms per household.",
+    "AveBedrms": "Average number of bedrooms per household.",
+    "Population": "Total population of the block group.",
+    "AveOccup": "Average number of household members.",
+    "Latitude": "Latitude of the block group.",
+    "Longitude": "Longitude of the block group.",
+}
+
+
+def _build_knowledge_base() -> list[str]:
+    docs: list[str] = []
+
+    docs.append(
+        f"Model overview: the app uses a {meta['model_type']} with "
+        f"{meta['n_estimators']} trees and max_depth={meta['max_depth']} to predict "
+        f"{meta['target_description']}."
+    )
+
+    docs.append(
+        f"Model performance metrics: R2 = {meta['metrics']['r2']:.3f}, "
+        f"MSE = {meta['metrics']['mse']:.3f}."
+    )
+
+    ranked = sorted(meta["feature_importance"].items(), key=lambda kv: kv[1], reverse=True)
+    docs.append(
+        "Feature importances, most to least influential: "
+        + ", ".join(f"{name} ({value:.3f})" for name, value in ranked)
+    )
+
+    docs.append(
+        f"Dataset overview: {len(df):,} rows. Columns are: {', '.join(meta['features'])}. "
+        f"The target predicts {meta['target_description']}."
+    )
+
+    for col, description in FEATURE_GLOSSARY.items():
+        if col in df.columns:
+            docs.append(f"Feature '{col}' meaning: {description}")
+
+    try:
+        stats = df.describe()
+        for col in stats.columns:
+            docs.append(
+                f"Statistics for '{col}': mean={stats.loc['mean', col]:.3f}, "
+                f"min={stats.loc['min', col]:.3f}, max={stats.loc['max', col]:.3f}, "
+                f"std={stats.loc['std', col]:.3f}."
+            )
+    except Exception:
+        pass
+
+    return docs
+
+
+KNOWLEDGE_BASE: list[str] = _build_knowledge_base()
+_vectorizer = TfidfVectorizer(stop_words="english")
+_kb_matrix = _vectorizer.fit_transform(KNOWLEDGE_BASE) if KNOWLEDGE_BASE else None
+
+
+def retrieve_context(query: str, k: int = 4) -> str:
+    """Return the k most relevant knowledge-base snippets for a query (local, no API call)."""
+    if _kb_matrix is None:
+        return ""
+    query_vec = _vectorizer.transform([query])
+    scores = cosine_similarity(query_vec, _kb_matrix).flatten()
+    top_indices = scores.argsort()[::-1][:k]
+    relevant = [KNOWLEDGE_BASE[i] for i in top_indices if scores[i] > 0]
+    return "\n".join(f"- {doc}" for doc in relevant)
 
 
 def _top_feature_importances(limit: int = 3) -> str:
@@ -118,6 +206,22 @@ def _is_quota_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "resource_exhausted" in text or "quota" in text or "rate limit" in text or "429" in text
 
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True for a per-day (RPD) quota block, e.g. quota_id contains 'PerDay'.
+    Retrying the same model won't help here — the whole point is to fall
+    through to the next model in MODEL_CHAIN instead."""
+    text = str(exc).lower()
+    return "perday" in text.replace(" ", "") or "requests_per_day" in text or "per day" in text
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Errors that are likely to succeed on a quick retry (as opposed to a
+    hard per-day quota block, which won't be fixed by waiting a few seconds)."""
+    text = str(exc).lower()
+    markers = ["503", "unavailable", "timeout", "deadline exceeded", "internal error", "500", "connection"]
+    return any(marker in text for marker in markers)
+
 SAFE_GLOBALS = {"pd": pd, "np": np, "df": df, "model": model}
 
 @tool
@@ -131,21 +235,83 @@ def run_python(code: str) -> str:
     return _run_python_code(code)
 
 tools = [run_python]
-llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
-    api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
-    temperature=0,
-    max_retries=0,
-).bind_tools(tools, tool_choice="auto")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-SYSTEM_PROMPT = (
-    f"You are a helpful assistant for a California housing price prediction app. "
-    f"Answer general questions directly. Only use tools when the user asks for data, calculations, or model-specific analysis. "
-    f"The trained model is a {meta['model_type']} that predicts {meta['target_description']}. "
-    "Use the run_python tool only when the answer depends on the dataset or the trained model. "
-    "Always compute real answers rather than guessing when the question depends on the data. "
-    "Keep answers concise and non-technical unless asked."
+# Model fallback chain, tried in order: Gemini Flash -> Gemini Flash-Lite ->
+# Groq (a different provider entirely, so it has its own independent daily
+# quota — genuinely useful once both Gemini tiers are exhausted for the day).
+# On a genuine daily-quota (RPD) error, we fall through to the next entry
+# instead of going straight to the local metadata fallback. Configure via
+# env vars, e.g.:
+#   GEMINI_MODEL=gemini-2.5-flash
+#   GEMINI_FALLBACK_MODELS=gemini-2.5-flash-lite
+#   GROQ_MODEL=llama-3.3-70b-versatile
+_gemini_primary = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_gemini_fallbacks = [
+    m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite").split(",") if m.strip()
+]
+_gemini_models = [_gemini_primary] + [m for m in _gemini_fallbacks if m != _gemini_primary]
+_groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# Each entry is (label, bound client), tried in this exact order.
+MODEL_CHAIN: list[tuple[str, Any]] = []
+
+for _model_name in _gemini_models:
+    MODEL_CHAIN.append((
+        f"gemini:{_model_name}",
+        ChatGoogleGenerativeAI(
+            model=_model_name,
+            api_key=GOOGLE_API_KEY,
+            temperature=0,
+            max_retries=2,
+            timeout=30,
+        ).bind_tools(tools, tool_choice="auto"),
+    ))
+
+if GROQ_API_KEY:
+    MODEL_CHAIN.append((
+        f"groq:{_groq_model}",
+        ChatGroq(
+            model=_groq_model,
+            api_key=GROQ_API_KEY,
+            temperature=0,
+            max_retries=2,
+            timeout=30,
+        ).bind_tools(tools, tool_choice="auto"),
+    ))
+else:
+    print("[chatbot] GROQ_API_KEY not set — Groq fallback tier is disabled. "
+          "Add GROQ_API_KEY to your .env to enable it.")
+
+BASE_SYSTEM_PROMPT = (
+    f"You are a helpful, general-purpose assistant embedded in a California housing price "
+    f"prediction app. You can and should answer ANY question the user asks — general knowledge, "
+    f"coding, math, explanations, advice, casual conversation, or anything else — exactly as a "
+    f"capable assistant normally would. You are not limited to app-related topics; do not refuse "
+    f"or deflect a question just because it isn't about this app or its dataset. "
+    f"\n\n"
+    f"For questions that ARE about this app specifically (the dataset, model, backend API, "
+    f"frontend, or project architecture): the trained model is a {meta['model_type']} that "
+    f"predicts {meta['target_description']}. You may be given a 'Relevant model/dataset "
+    "information' section retrieved from a local knowledge base — use it to answer whenever it's "
+    "sufficient, and don't call any tool if it already answers the question. Only use the "
+    "run_python tool when the question needs a live computation the retrieved information doesn't "
+    "cover (e.g. a filter, custom aggregation, or a prediction on new inputs), and always compute "
+    "real answers rather than guessing when the answer depends on the data. "
+    "\n\n"
+    "For everything else, just answer directly from your own knowledge, the same way you would in "
+    "any normal conversation — there is no local knowledge base or tool for general topics, and "
+    "that's expected. "
+    "Keep answers concise and non-technical unless the user asks for more depth."
 )
+
+
+def _build_system_prompt(message: str) -> str:
+    context = retrieve_context(message)
+    if not context:
+        return BASE_SYSTEM_PROMPT
+    return f"{BASE_SYSTEM_PROMPT}\n\nRelevant model/dataset information:\n{context}"
 
 def _message_value(message: Any, key: str, default: Any = None) -> Any:
     if isinstance(message, dict):
@@ -165,13 +331,45 @@ def _extract_code_from_tool_call(tool_call: Any) -> str:
     return ""
 
 
-def _invoke_llm(messages: list[Any]):
-    return llm.invoke([SystemMessage(content=SYSTEM_PROMPT)] + messages)
+def _invoke_llm(messages: list[Any], system_prompt: str, max_attempts_per_model: int = 2):
+    full_messages = [SystemMessage(content=system_prompt)] + messages
+    last_exc: Exception | None = None
+
+    for label, client in MODEL_CHAIN:
+        for attempt in range(max_attempts_per_model):
+            try:
+                response = client.invoke(full_messages)
+                if label != MODEL_CHAIN[0][0]:
+                    print(f"[chatbot] Answered using fallback model '{label}'.")
+                return response
+            except Exception as exc:
+                last_exc = exc
+                is_last_attempt_for_model = attempt == max_attempts_per_model - 1
+                if _is_daily_quota_error(exc):
+                    # This model is done for the day — no point retrying it,
+                    # move straight on to the next model in the chain.
+                    print(f"[chatbot] '{label}' hit its daily quota, trying next model in chain.")
+                    break
+                if _is_transient_error(exc) and not is_last_attempt_for_model:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                if _is_quota_error(exc) and not is_last_attempt_for_model:
+                    # Likely a short per-minute burst — worth one brief retry
+                    # on the same model before moving on.
+                    time.sleep(3)
+                    continue
+                if is_last_attempt_for_model:
+                    break
+                raise
+
+    # Every model in the chain failed.
+    raise last_exc  # type: ignore[misc]
 
 
 def _answer_with_one_tool_round(message: str) -> str:
+    system_prompt = _build_system_prompt(message)
     user_messages: list[Any] = [("user", message)]
-    first_response = _invoke_llm(user_messages)
+    first_response = _invoke_llm(user_messages, system_prompt)
 
     tool_calls = _message_value(first_response, "tool_calls", []) or []
     if not tool_calls:
@@ -192,7 +390,7 @@ def _answer_with_one_tool_round(message: str) -> str:
         return _message_value(first_response, "content", "") or ""
 
     follow_up_messages: list[Any] = user_messages + [first_response] + tool_messages
-    final_response = _invoke_llm(follow_up_messages)
+    final_response = _invoke_llm(follow_up_messages, system_prompt)
     final_content = _message_value(final_response, "content", "") or ""
     if final_content:
         return final_content
@@ -202,6 +400,10 @@ def ask_chatbot(message: str) -> str:
     try:
         return _answer_with_one_tool_round(message)
     except Exception as exc:
+        # Surface the real error server-side — without this you can't tell a
+        # genuine daily quota cap apart from a per-minute burst limit, a bad
+        # API key, or a wrong model name, all of which land here differently.
+        print(f"[chatbot] Gemini call failed: {type(exc).__name__}: {exc}")
         if _is_quota_error(exc):
             return _quota_fallback_response(message)
         return "Sorry, the chatbot is temporarily unavailable right now. Please try again later."

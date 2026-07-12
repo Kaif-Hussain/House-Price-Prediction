@@ -132,7 +132,7 @@ def run_python(code: str) -> str:
 
 tools = [run_python]
 llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
     api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
     temperature=0,
     max_retries=0,
